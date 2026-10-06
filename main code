@@ -1,0 +1,180 @@
+import requests
+import dns.resolver
+import tldextract
+import sys
+import urllib3
+from urllib.parse import urlparse
+import re
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+class UltimateDefensiveAuditor:
+    def __init__(self, target_url):
+        self.target_url = target_url
+        self.parsed = urlparse(target_url)
+        self.domain = tldextract.extract(self.parsed.netloc).top_domain_under_public_suffix
+        self.headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) DefenderBot/3.0'
+        }
+        self.session = requests.Session()
+        self.session.verify = False
+        self.session.headers.update(self.headers)
+        self.cdn_signatures = [
+            'cloudflare', 'arvancloud', 'akamai', 'fastly',
+            'incapsula', 'imperva', 'sucuri'
+        ]
+
+    def print_header(self, title):
+        print(f"\n{'='*60}")
+        print(f"🔍 {title}")
+        print(f"{'='*60}")
+
+    def check_infrastructure(self):
+        self.print_header("INFRASTRUCTURE & CDN FINGERPRINTING")
+        try:
+            resp = self.session.get(self.target_url, timeout=10)
+            server = resp.headers.get('Server', '').lower()
+            via = resp.headers.get('Via', '').lower()
+            x_cache = resp.headers.get('X-Cache', 'NOT-SET')
+
+            is_cdn = any(sig in server or sig in via for sig in self.cdn_signatures)
+
+            if is_cdn:
+                print(f"  ✅ CDN Detected: Server={resp.headers.get('Server', 'N/A')} | Via={resp.headers.get('Via', 'N/A')}")
+            else:
+                print(f"  ⚠️  NO CDN: Direct Origin Exposure! Server={resp.headers.get('Server', 'N/A')}")
+
+            print(f"  ℹ️  Cache Status: {x_cache}")
+
+            print("\n  [Cookie Security Flags]")
+            for cookie in resp.cookies:
+                secure = "✅ Secure" if cookie.secure else "❌ INSECURE (No Secure Flag)"
+                httponly = "✅ HttpOnly" if cookie.has_nonstandard_attr('httponly') else "❌ INSECURE (No HttpOnly)"
+                samesite = cookie.get_nonstandard_attr('samesite', 'None')
+                print(f"    • {cookie.name}: {secure} | {httponly} | SameSite={samesite}")
+        except Exception as e:
+            print(f"  ❌ Connection Error: {e}")
+
+    def check_owasp_headers(self):
+        self.print_header("OWASP SECURITY HEADERS AUDIT")
+        try:
+            resp = self.session.get(self.target_url, timeout=10)
+            required_headers = {
+                'Strict-Transport-Security': 'HSTS (Prevents SSL Stripping)',
+                'Content-Security-Policy': 'CSP (Prevents XSS)',
+                'X-Frame-Options': 'Clickjacking Protection',
+                'X-Content-Type-Options': 'MIME Sniffing Prevention',
+                'Referrer-Policy': 'Data Leakage Prevention'
+            }
+            for header, desc in required_headers.items():
+                if header in resp.headers:
+                    print(f"  ✅ {header}: {resp.headers[header][:50]}...")
+                else:
+                    print(f"  ❌ MISSING: {header} ({desc})")
+        except Exception as e:
+            print(f"  ❌ Error: {e}")
+
+    def check_dns_leakage(self):
+        self.print_header("TRICK 1: ORIGIN IP LEAKAGE VIA DNS (CRITICAL)")
+        print("  (Checking if MX/SPF records expose the real Origin IP behind CDN)")
+        try:
+            mx_answers = dns.resolver.resolve(self.domain, 'MX')
+            for rdata in mx_answers:
+                mx_host = str(rdata.exchange).rstrip('.')
+                try:
+                    ip_answers = dns.resolver.resolve(mx_host, 'A')
+                    for ip in ip_answers:
+                        print(f"  ⚠️  MX Record '{mx_host}' resolves to: {ip}")
+                        print(f"      ↳ ACTION: Verify if this IP is open to public web traffic (Port 80/443)!")
+                except Exception:
+                    pass
+        except Exception:
+            print("  ℹ️  No MX records found.")
+
+        try:
+            txt_answers = dns.resolver.resolve(self.domain, 'TXT')
+            for rdata in txt_answers:
+                txt_string = str(rdata)
+                if 'v=spf1' in txt_string:
+                    ip4_matches = re.findall(r'ip4:([0-9\.]+)', txt_string)
+                    for ip in ip4_matches:
+                        print(f"  ⚠️  SPF Record contains direct IP: {ip}")
+                        print(f"      ↳ ACTION: If this IP serves web content, attackers can bypass CDN!")
+        except Exception:
+            pass
+
+    def check_waf_honeypots(self):
+        self.print_header("TRICK 2: WAF BEHAVIORAL FINGERPRINTING (HONEYPOTS)")
+        honeypots = ['/.env', '/.git/HEAD', '/wp-admin/', '/administrator/']
+        for path in honeypots:
+            try:
+                resp = self.session.get(
+                    self.target_url.rstrip('/') + path, timeout=5
+                )
+                status = resp.status_code
+
+                if status == 404:
+                    print(f"  ℹ️  {path}: 404 Not Found (Standard Server)")
+                elif status == 403:
+                    if 'cloudflare' in resp.text.lower() or 'cf-ray' in resp.headers:
+                        print(f"  🛡️  {path}: 403 Forbidden (Cloudflare WAF Block)")
+                    elif 'arvancloud' in resp.text.lower():
+                        print(f"  🛡️  {path}: 403 Forbidden (ArvanCloud WAF Block)")
+                    else:
+                        print(f"  ⚠️  {path}: 403 Forbidden (Generic/Server Block)")
+                elif status in (406, 429):
+                    print(f"  🛡️  {path}: {status} (Advanced WAF/Bot Protection Triggered)")
+                else:
+                    body_snippet = resp.text[:100].replace('\n', ' ').strip()
+                    print(f"  ❌ {path}: {status} (Potential Misconfiguration!) -> {body_snippet}...")
+            except Exception:
+                pass
+
+    def check_cors_and_methods(self):
+        self.print_header("TRICK 3 & 4: CORS MISCONFIGURATION & HTTP METHODS")
+        try:
+            evil_origin = 'https://evil-attacker.com'
+            headers = {'Origin': evil_origin}
+            resp = self.session.get(self.target_url, headers=headers, timeout=10)
+            acao = resp.headers.get('Access-Control-Allow-Origin', '')
+            acac = resp.headers.get('Access-Control-Allow-Credentials', '')
+
+            if acao == evil_origin and acac == 'true':
+                print(f"  🚨 CRITICAL CORS VULNERABILITY: Server trusts '{evil_origin}' with Credentials!")
+            elif acao == '*':
+                print(f"  ⚠️  WILD CARD CORS: Access-Control-Allow-Origin is '*'")
+            else:
+                print(f"  ✅ CORS: Properly restricted (Returned: {acao})")
+
+            resp_opt = self.session.options(self.target_url, timeout=10)
+            allow = resp_opt.headers.get('Allow', '')
+            if allow:
+                if 'TRACE' in allow:
+                    print(f"  🚨 INSECURE METHOD: TRACE is enabled (Vulnerable to XST)")
+                else:
+                    print(f"  ℹ️  Allowed Methods: {allow}")
+            else:
+                print(f"  ℹ️  OPTIONS request did not return 'Allow' header.")
+        except Exception as e:
+            print(f"  ❌ Error during CORS/Methods check: {e}")
+
+    def run(self):
+        print(f"\n🎯 TARGET: {self.target_url}")
+        print(f"🌐 DOMAIN: {self.domain}")
+        self.check_infrastructure()
+        self.check_owasp_headers()
+        self.check_dns_leakage()
+        self.check_waf_honeypots()
+        self.check_cors_and_methods()
+        print(f"\n{'='*60}")
+        print("✅ AUDIT COMPLETE. Review warnings and fix misconfigurations.")
+        print(f"{'='*60}\n")
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: python3 ultimate_audit.py <https://target.com>")
+    else:
+        auditor = UltimateDefensiveAuditor(sys.argv[1])
+        auditor.run()
